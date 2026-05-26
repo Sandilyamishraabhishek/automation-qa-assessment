@@ -1,0 +1,314 @@
+{
+  "name": "Bonus – Uptime Monitor (demo.realworld.io)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      },
+      "id": "node-uptime-trigger",
+      "name": "Schedule – Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Initialise the ping attempt counter for retry logic\nreturn [{\n  json: {\n    targetUrl: 'https://demo.realworld.io',\n    attempt: 1,\n    maxAttempts: 3,\n    pingStart: Date.now()\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Initialise Ping State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.targetUrl }}",
+        "options": {
+          "timeout": 10000,
+          "redirect": { "redirect": { "followRedirects": true, "maxRedirects": 3 } },
+          "response": { "response": { "fullResponse": true, "neverError": true } }
+        }
+      },
+      "id": "node-ping",
+      "name": "Ping – GET demo.realworld.io",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Record response time and status\nconst pingStart = $('Initialise Ping State').first().json.pingStart;\nconst attempt   = $('Initialise Ping State').first().json.attempt;\nconst resp      = $input.first().json;\n\nconst responseTimeMs = Date.now() - pingStart;\nconst statusCode     = resp.statusCode ?? resp.status ?? 0;\nconst ok             = statusCode === 200;\nconst slow           = responseTimeMs > 3000;   // >3 s counts as degraded\n\nreturn [{\n  json: {\n    targetUrl:      'https://demo.realworld.io',\n    statusCode,\n    ok,\n    slow,\n    responseTimeMs,\n    attempt,\n    checkedAt:      new Date().toUTCString(),\n    shouldAlert:    !ok || slow\n  }\n}];\n"
+      },
+      "id": "node-check-status",
+      "name": "Evaluate Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-should-retry",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals" }
+            },
+            {
+              "id": "cond-attempt-lt-max",
+              "leftValue": "={{ $json.attempt }}",
+              "rightValue": 3,
+              "operator": { "type": "number", "operation": "lt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-retry",
+      "name": "IF – Should Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1140, 300]
+    },
+    {
+      "parameters": {
+        "amount": 15,
+        "unit": "seconds"
+      },
+      "id": "node-wait",
+      "name": "Wait 15s Before Retry",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1380, 160],
+      "webhookId": "wait-retry-uptime"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Increment attempt counter and reset ping start time\nconst prev = $input.first().json;\nreturn [{\n  json: {\n    targetUrl:   prev.targetUrl,\n    attempt:     (prev.attempt || 1) + 1,\n    maxAttempts: 3,\n    pingStart:   Date.now()\n  }\n}];\n"
+      },
+      "id": "node-increment-attempt",
+      "name": "Increment Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 160]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-alert",
+              "leftValue": "={{ $json.shouldAlert }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-alert",
+      "name": "IF – Alert Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1380, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a Discord alert message for downtime or slow response\nconst r = $input.first().json;\n\nlet severity = '';\nlet detail   = '';\n\nif (!r.ok) {\n  severity = r.statusCode === 0\n    ? '🔴 **DOWN** (connection failed / timeout)'\n    : `🔴 **ERROR** (HTTP ${r.statusCode})`;\n  detail = `The app returned a non-200 status after ${r.attempt} attempt(s).`;\n} else if (r.slow) {\n  severity = '🟡 **SLOW** (response degraded)';\n  detail   = `Response time: **${r.responseTimeMs} ms** (threshold: 3 000 ms).`;\n}\n\nconst msg = [\n  `## Uptime Alert – demo.realworld.io`,\n  `**Status:** ${severity}`,\n  `**Response Time:** ${r.responseTimeMs} ms`,\n  `**HTTP Status:** ${r.statusCode || 'N/A (connection error)'}`,\n  `**Attempts:** ${r.attempt} / 3`,\n  `**Detail:** ${detail}`,\n  `**Checked at:** ${r.checkedAt}`,\n  `**Target:** ${r.targetUrl}`\n].join('\\n');\n\nreturn [{ json: { content: msg } }];\n"
+      },
+      "id": "node-build-alert",
+      "name": "Build Alert Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $credentials.discordWebhookUrl }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "content", "value": "={{ $json.content }}" }
+          ]
+        },
+        "options": { "timeout": 8000 }
+      },
+      "id": "node-discord-alert",
+      "name": "Send Alert to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1860, 360],
+      "credentials": {
+        "httpQueryAuth": { "id": "cred-discord-webhook", "name": "Discord Webhook URL" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Store result in static data for daily summary\n// n8n's staticData persists across executions of the same workflow\nconst data   = $input.first().json;\nconst stored = $getWorkflowStaticData('global');\n\nif (!stored.checks) stored.checks = [];\n\nstored.checks.push({\n  ts:            Date.now(),\n  statusCode:    data.statusCode,\n  ok:            data.ok,\n  responseTimeMs: data.responseTimeMs\n});\n\n// Keep only the last 288 checks (24 h × 12 checks/h at 5-min interval)\nif (stored.checks.length > 288) {\n  stored.checks = stored.checks.slice(-288);\n}\n\nconst total  = stored.checks.length;\nconst passed = stored.checks.filter(c => c.ok).length;\nconst uptime = ((passed / total) * 100).toFixed(2);\nconst avgMs  = Math.round(\n  stored.checks.reduce((s, c) => s + (c.responseTimeMs || 0), 0) / total\n);\n\nstored.dailySummary = { total, passed, uptime, avgMs };\n\nreturn [{ json: { logged: true, uptime, avgMs, total } }];\n"
+      },
+      "id": "node-log",
+      "name": "Log Result to Static Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, 560],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 8 * * *" }]
+        }
+      },
+      "id": "node-daily-trigger",
+      "name": "Schedule – Daily 08:00 Summary",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 620]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read stored stats and build a daily summary\nconst stored = $getWorkflowStaticData('global');\nconst s      = stored.dailySummary || { total: 0, uptime: 'N/A', avgMs: 'N/A' };\n\nconst checks  = stored.checks || [];\nconst last24h = checks.filter(c => c.ts > Date.now() - 86400000);\nconst failed  = last24h.filter(c => !c.ok).length;\n\nconst msg = [\n  '## 📊 Daily Uptime Summary – demo.realworld.io',\n  `**Date:** ${new Date().toUTCString()}`,\n  `**Checks in last 24h:** ${last24h.length}`,\n  `**Uptime:** ${s.uptime}%`,\n  `**Failed checks:** ${failed}`,\n  `**Avg response time:** ${s.avgMs} ms`,\n  `**Status:** ${parseFloat(s.uptime) >= 99 ? '✅ Healthy' : parseFloat(s.uptime) >= 95 ? '🟡 Degraded' : '🔴 Incident'}`\n].join('\\n');\n\nreturn [{ json: { content: msg } }];\n"
+      },
+      "id": "node-build-summary",
+      "name": "Build Daily Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 620]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $credentials.discordWebhookUrl }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "content", "value": "={{ $json.content }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-discord-summary",
+      "name": "Send Daily Summary to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 620],
+      "credentials": {
+        "httpQueryAuth": { "id": "cred-discord-webhook", "name": "Discord Webhook URL" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {},
+      "id": "node-error-trigger-uptime",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [200, 800]
+    },
+    {
+      "parameters": {
+        "jsCode": "const err = $input.first().json;\nreturn [{\n  json: {\n    content: [\n      '🚨 **Uptime Monitor Workflow Error**',\n      `**Node:** ${err.execution?.lastNodeExecuted ?? 'Unknown'}`,\n      `**Error:** ${err.execution?.error?.message ?? JSON.stringify(err)}`,\n      `**Time:** ${new Date().toUTCString()}`\n    ].join('\\n')\n  }\n}];\n"
+      },
+      "id": "node-format-uptime-error",
+      "name": "Format Workflow Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 800]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $credentials.discordWebhookUrl }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "content", "value": "={{ $json.content }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-discord-wf-error",
+      "name": "Send Workflow Error to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 800],
+      "credentials": {
+        "httpQueryAuth": { "id": "cred-discord-webhook", "name": "Discord Webhook URL" }
+      },
+      "continueOnFail": false
+    }
+  ],
+  "connections": {
+    "Schedule – Every 5 Minutes": {
+      "main": [[{ "node": "Initialise Ping State", "type": "main", "index": 0 }]]
+    },
+    "Initialise Ping State": {
+      "main": [[{ "node": "Ping – GET demo.realworld.io", "type": "main", "index": 0 }]]
+    },
+    "Ping – GET demo.realworld.io": {
+      "main": [[{ "node": "Evaluate Response", "type": "main", "index": 0 }]]
+    },
+    "Evaluate Response": {
+      "main": [
+        [{ "node": "IF – Should Retry?", "type": "main", "index": 0 }],
+        [{ "node": "Log Result to Static Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF – Should Retry?": {
+      "main": [
+        [{ "node": "Wait 15s Before Retry", "type": "main", "index": 0 }],
+        [{ "node": "IF – Alert Needed?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait 15s Before Retry": {
+      "main": [[{ "node": "Increment Attempt", "type": "main", "index": 0 }]]
+    },
+    "Increment Attempt": {
+      "main": [[{ "node": "Ping – GET demo.realworld.io", "type": "main", "index": 0 }]]
+    },
+    "IF – Alert Needed?": {
+      "main": [
+        [{ "node": "Build Alert Message", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Build Alert Message": {
+      "main": [[{ "node": "Send Alert to Discord", "type": "main", "index": 0 }]]
+    },
+    "Schedule – Daily 08:00 Summary": {
+      "main": [[{ "node": "Build Daily Summary", "type": "main", "index": 0 }]]
+    },
+    "Build Daily Summary": {
+      "main": [[{ "node": "Send Daily Summary to Discord", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Format Workflow Error", "type": "main", "index": 0 }]]
+    },
+    "Format Workflow Error": {
+      "main": [[{ "node": "Send Workflow Error to Discord", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-05-25T00:00:00.000Z",
+  "versionId": "bonus-uptime-v1"
+}

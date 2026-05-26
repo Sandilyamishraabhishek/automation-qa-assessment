@@ -1,0 +1,270 @@
+{
+  "name": "Task2 Morning Brief – GitHub Trending + Enrichment",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 1 }]
+        }
+      },
+      "id": "node-schedule-trigger",
+      "name": "Schedule Trigger (Every 1h)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.github.com/search/repositories",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "q", "value": "topic:ai pushed:>2024-01-01" },
+            { "name": "sort", "value": "stars" },
+            { "name": "order", "value": "desc" },
+            { "name": "per_page", "value": "20" }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "node-github-search",
+      "name": "GitHub Search – AI Repos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 300],
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-github-token", "name": "GitHub Token Header" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Transformation node ────────────────────────────────────────────────────\n// Goal: filter the raw GitHub search response down to the top 5 repositories,\n// keep only the fields we care about, and flag repos with > 1 000 stars.\n\nconst items = $input.all();\n\n// Guard: if the upstream HTTP call failed, propagate the error object\nif (items[0].json.error || items[0].json.message) {\n  return [{\n    json: {\n      error: true,\n      message: items[0].json.message || 'GitHub API error',\n      raw: items[0].json\n    }\n  }];\n}\n\nconst repos = items[0].json.repositories || items[0].json.items || [];\n\n// Sort by stars descending and take top 5\nconst top5 = repos\n  .sort((a, b) => b.stargazers_count - a.stargazers_count)\n  .slice(0, 5)\n  .map((repo, idx) => ({\n    rank: idx + 1,\n    name: repo.full_name,\n    description: (repo.description || 'No description').slice(0, 120),\n    stars: repo.stargazers_count,\n    forks: repo.forks_count,\n    language: repo.language || 'Unknown',\n    url: repo.html_url,\n    api_url: repo.url,\n    pushed_at: repo.pushed_at,\n    highStars: repo.stargazers_count > 1000   // used by the IF node\n  }));\n\nif (top5.length === 0) {\n  return [{ json: { error: true, message: 'No repositories returned by GitHub API.' } }];\n}\n\n// Return one item per repo so downstream nodes can iterate\nreturn top5.map(repo => ({ json: repo }));\n"
+      },
+      "id": "node-transform",
+      "name": "Transform – Top 5 Repos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-high-stars",
+              "leftValue": "={{ $json.highStars }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-stars",
+      "name": "IF – Stars > 1000",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [920, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.github.com/repos/' + $json.name }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 8000 }
+      },
+      "id": "node-enrich-hot",
+      "name": "Enrich – Fetch Repo Details (Hot)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1160, 180],
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-github-token", "name": "GitHub Token Header" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.github.com/repos/' + $json.name + '/readme' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 8000 }
+      },
+      "id": "node-enrich-cold",
+      "name": "Enrich – Fetch README (Regular)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1160, 420],
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-github-token", "name": "GitHub Token Header" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge enrichment data (hot path) with what we already know\nconst enriched = $input.first().json;\nconst prev = $('IF – Stars > 1000').first().json;\n\nreturn [{\n  json: {\n    ...prev,\n    open_issues: enriched.open_issues_count ?? 'N/A',\n    watchers: enriched.watchers_count ?? 'N/A',\n    license: enriched.license?.spdx_id ?? 'None',\n    homepage: enriched.homepage || '',\n    badge: '🔥',\n    tier: 'HOT (>1k stars)'\n  }\n}];\n"
+      },
+      "id": "node-merge-hot",
+      "name": "Merge Hot Enrichment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, 180],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge enrichment data (regular path)\nconst readmeData = $input.first().json;\nconst prev = $('IF – Stars > 1000').itemMatching(0)?.json || {};\n\nreturn [{\n  json: {\n    ...prev,\n    readme_exists: !readmeData.message,\n    readme_size: readmeData.size ?? 0,\n    badge: '📌',\n    tier: 'REGULAR'\n  }\n}];\n"
+      },
+      "id": "node-merge-cold",
+      "name": "Merge Regular Enrichment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, 420],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "node-merge-all",
+      "name": "Merge All Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1640, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final Discord embed message\nconst items = $input.all();\n\nconst lines = items.map(item => {\n  const r = item.json;\n  const stars = r.stars?.toLocaleString() ?? '?';\n  const forks = r.forks?.toLocaleString() ?? '?';\n  const lang = r.language || 'Unknown';\n  const tier = r.tier || '';\n  const badge = r.badge || '';\n  return [\n    `**${r.rank}. ${badge} [${r.name}](${r.url})**`,\n    `> ${r.description}`,\n    `\\`⭐ ${stars}  🍴 ${forks}  💻 ${lang}  ${tier}\\``,\n    ''\n  ].join('\\n');\n}).join('\\n');\n\nconst now = new Date().toUTCString();\nconst content = [\n  '## 🤖 GitHub AI Repos – Morning Brief',\n  `*Generated at ${now}*`,\n  '',\n  lines,\n  '---',\n  '*Threshold: repos with >1 000 stars are marked 🔥 and enriched with issue/licence data.*'\n].join('\\n');\n\nreturn [{ json: { content: content.slice(0, 2000) } }];\n"
+      },
+      "id": "node-build-message",
+      "name": "Build Discord Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1880, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $credentials.discordWebhookUrl }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "content", "value": "={{ $json.content }}" }
+          ]
+        },
+        "options": { "timeout": 8000 }
+      },
+      "id": "node-discord",
+      "name": "Send to Discord Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2120, 300],
+      "credentials": {
+        "httpQueryAuth": { "id": "cred-discord-webhook", "name": "Discord Webhook URL" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {},
+      "id": "node-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [200, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format an error alert message\nconst err = $input.first().json;\nreturn [{\n  json: {\n    content: [\n      '🚨 **n8n Workflow Error – Morning Brief**',\n      `**Workflow:** ${err.workflow?.name ?? 'Morning Brief'}`,\n      `**Node:** ${err.execution?.lastNodeExecuted ?? 'Unknown'}`,\n      `**Error:** ${err.execution?.error?.message ?? JSON.stringify(err)}`,\n      `**Time:** ${new Date().toUTCString()}`\n    ].join('\\n')\n  }\n}];\n"
+      },
+      "id": "node-format-error",
+      "name": "Format Error Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 600]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $credentials.discordWebhookUrl }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "content", "value": "={{ $json.content }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-discord-error",
+      "name": "Send Error to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 600],
+      "credentials": {
+        "httpQueryAuth": { "id": "cred-discord-webhook", "name": "Discord Webhook URL" }
+      },
+      "continueOnFail": false
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (Every 1h)": {
+      "main": [[{ "node": "GitHub Search – AI Repos", "type": "main", "index": 0 }]]
+    },
+    "GitHub Search – AI Repos": {
+      "main": [[{ "node": "Transform – Top 5 Repos", "type": "main", "index": 0 }]]
+    },
+    "Transform – Top 5 Repos": {
+      "main": [[{ "node": "IF – Stars > 1000", "type": "main", "index": 0 }]]
+    },
+    "IF – Stars > 1000": {
+      "main": [
+        [{ "node": "Enrich – Fetch Repo Details (Hot)", "type": "main", "index": 0 }],
+        [{ "node": "Enrich – Fetch README (Regular)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Enrich – Fetch Repo Details (Hot)": {
+      "main": [[{ "node": "Merge Hot Enrichment", "type": "main", "index": 0 }]]
+    },
+    "Enrich – Fetch README (Regular)": {
+      "main": [[{ "node": "Merge Regular Enrichment", "type": "main", "index": 0 }]]
+    },
+    "Merge Hot Enrichment": {
+      "main": [[{ "node": "Merge All Results", "type": "main", "index": 0 }]]
+    },
+    "Merge Regular Enrichment": {
+      "main": [[{ "node": "Merge All Results", "type": "main", "index": 1 }]]
+    },
+    "Merge All Results": {
+      "main": [[{ "node": "Build Discord Message", "type": "main", "index": 0 }]]
+    },
+    "Build Discord Message": {
+      "main": [[{ "node": "Send to Discord Webhook", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Format Error Message", "type": "main", "index": 0 }]]
+    },
+    "Format Error Message": {
+      "main": [[{ "node": "Send Error to Discord", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-05-25T00:00:00.000Z",
+  "versionId": "task2-v1"
+}
